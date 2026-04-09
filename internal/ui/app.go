@@ -146,6 +146,10 @@ func (a *App) reloadConfig() error {
 }
 
 func (a *App) handleConnect(input string) {
+	if shouldClearBeforeFuzzyConnect(input) {
+		clearScreen()
+	}
+
 	machine, err := a.resolveMachineInput(input)
 	if err != nil {
 		fmt.Printf("选择主机失败: %v\n", err)
@@ -434,6 +438,10 @@ func (a *App) browseMachineList(title string, items []config.IndexedMachine) {
 				fmt.Println("没有资产")
 				continue
 			}
+			if len(matches) == 1 {
+				a.connectToMachine(matches[0])
+				return
+			}
 			current = matches
 			page = 1
 			needsRedraw = true
@@ -451,6 +459,10 @@ func (a *App) browseMachineList(title string, items []config.IndexedMachine) {
 				fmt.Println("没有资产")
 				continue
 			}
+			if len(matches) == 1 {
+				a.connectToMachine(matches[0])
+				return
+			}
 			current = matches
 			page = 1
 			needsRedraw = true
@@ -459,6 +471,10 @@ func (a *App) browseMachineList(title string, items []config.IndexedMachine) {
 			if len(matches) == 0 {
 				fmt.Println("没有资产")
 				continue
+			}
+			if len(matches) == 1 {
+				a.connectToMachine(matches[0])
+				return
 			}
 			current = matches
 			page = 1
@@ -632,6 +648,21 @@ func calcPageCount(totalItems, pageSize int) int {
 
 func colorizeGreen(value string) string {
 	return greenText + value + resetText
+}
+
+func shouldClearBeforeFuzzyConnect(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "/") {
+		return false
+	}
+	if _, err := strconv.Atoi(trimmed); err == nil {
+		return false
+	}
+
+	return true
 }
 
 func clearScreen() {
