@@ -1,0 +1,16 @@
+# 本地真实配置
+config.yaml
+config.local.yaml
+
+# 二进制产物
+sshtools
+dist/
+
+# IDE
+.idea/
+
+# OS
+.DS_Store
+
+# 测试与覆盖率
+coverage.out

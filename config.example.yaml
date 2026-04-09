@@ -1,0 +1,50 @@
+default_ip_type: public
+ssh_timeout: 15s
+
+groups:
+  - name: 生产环境
+    tag: prod
+    machines:
+      - name: prod-web-01
+        intranet_ip: 192.168.10.11
+        public_ip: 1.2.3.4
+        port: 22
+        user: root
+        private_key_path: ~/.ssh/id_rsa
+        private_key_passphrase: ""
+        password: ""
+        platform: Linux
+
+      - name: prod-nginx-01
+        intranet_ip: 192.168.10.12
+        public_ip: 1.2.3.5
+        port: 22
+        user: root
+        password: "change-me"
+        private_key_path: ""
+        private_key_passphrase: ""
+        platform: Linux
+
+  - name: 测试环境
+    tag: test
+    machines:
+      - name: test-app-01
+        intranet_ip: 192.168.20.21
+        public_ip: ""
+        port: 22
+        user: ubuntu
+        private_key_path: ~/.ssh/id_rsa
+        private_key_passphrase: ""
+        password: ""
+        platform: Linux
+
+machines:
+  - name: legacy-host-01
+    intranet_ip: 192.168.99.10
+    public_ip: ""
+    port: 22
+    user: root
+    password: "change-me"
+    private_key_path: ""
+    private_key_passphrase: ""
+    platform: Linux
