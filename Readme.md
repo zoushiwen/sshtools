@@ -2,6 +2,12 @@
 
 `sshtools` 是一个面向多主机场景的命令行 SSH 管理工具，交互风格接近 JumpServer，适合运维、开发和测试环境中的日常登录、主机检索、文件上传下载。
 
+## 演示
+
+<p align="center">
+  <img src="./image/users.gif" alt="sshtools demo" />
+</p>
+
 ## 特性
 
 - 支持主机分组与 `tag` 过滤

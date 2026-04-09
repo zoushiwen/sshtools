@@ -6,8 +6,8 @@ groups:
     tag: prod
     machines:
       - name: prod-web-01
-        intranet_ip: 192.168.10.11
-        public_ip: 1.2.3.4
+        intranet_ip: 192.168.2.200
+        public_ip: 192.168.2.200
         port: 22
         user: root
         private_key_path: ~/.ssh/id_rsa
@@ -37,14 +37,3 @@ groups:
         private_key_passphrase: ""
         password: ""
         platform: Linux
-
-machines:
-  - name: legacy-host-01
-    intranet_ip: 192.168.99.10
-    public_ip: ""
-    port: 22
-    user: root
-    password: "change-me"
-    private_key_path: ""
-    private_key_passphrase: ""
-    platform: Linux
