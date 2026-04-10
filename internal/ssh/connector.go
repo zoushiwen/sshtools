@@ -111,7 +111,13 @@ func (c *Connector) StartInteractiveSession(machine config.Machine, host string)
 	}
 	defer session.Close()
 
-	fd := int(os.Stdin.Fd())
+	tty, err := openInteractiveTTY()
+	if err != nil {
+		return err
+	}
+	defer tty.Close()
+
+	fd := int(tty.Fd())
 	if !term.IsTerminal(fd) {
 		return errors.New("当前终端不支持交互式 SSH 会话")
 	}
@@ -197,6 +203,20 @@ func (c *Connector) StartInteractiveSession(machine config.Machine, host string)
 	}
 
 	return nil
+}
+
+func openInteractiveTTY() (*os.File, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err == nil {
+		return tty, nil
+	}
+
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		return nil, fmt.Errorf("打开控制终端失败: %w", err)
+	}
+
+	return nil, errors.New("当前终端不支持交互式 SSH 会话")
 }
 
 func copyInteractiveInput(fd int, writer io.WriteCloser, done <-chan struct{}) error {

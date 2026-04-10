@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/mattn/go-runewidth"
+	"golang.org/x/term"
 
 	"sshtools/config"
 	sftpclient "sshtools/internal/sftp"
@@ -20,19 +21,22 @@ import (
 )
 
 const (
-	machinePageSize = 35
-	greenText       = "\033[32m"
-	resetText       = "\033[0m"
+	machinePageSize     = 35
+	commandHistoryLimit = 100
+	greenText           = "\033[32m"
+	resetText           = "\033[0m"
 )
 
 var ansiRegexp = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
 type App struct {
-	reader     *bufio.Reader
-	configPath string
-	cfg        *config.Config
-	ssh        *sshconn.Connector
-	sftp       *sftpclient.Client
+	reader         *bufio.Reader
+	commandHistory []string
+	hostHistory    []string
+	configPath     string
+	cfg            *config.Config
+	ssh            *sshconn.Connector
+	sftp           *sftpclient.Client
 }
 
 func NewApp(configPath string) (*App, error) {
@@ -56,7 +60,7 @@ func (a *App) Run() error {
 	a.printWelcome()
 
 	for {
-		input, err := a.readLine("Opt> ")
+		input, err := a.readCommandLine("Opt> ", &a.commandHistory)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				fmt.Println()
@@ -69,6 +73,7 @@ func (a *App) Run() error {
 		if trimmed == "" {
 			continue
 		}
+		appendHistory(&a.commandHistory, trimmed)
 
 		fields := strings.Fields(trimmed)
 		switch strings.ToLower(fields[0]) {
@@ -218,13 +223,14 @@ func (a *App) selectMachineFromMatches(matches []config.IndexedMachine) (config.
 		a.printSearchResultPage(current, page)
 		a.printSearchPrompt(lastQuery)
 
-		choice, err := a.readLine("[Host]> ")
+		choice, err := a.readCommandLine("[Host]> ", &a.hostHistory)
 		if err != nil {
 			return config.IndexedMachine{}, err
 		}
 
 		trimmed := strings.TrimSpace(choice)
 		lastQuery = trimmed
+		appendHistory(&a.hostHistory, trimmed)
 
 		switch strings.ToLower(trimmed) {
 		case "":
@@ -269,6 +275,9 @@ func (a *App) selectMachineFromMatches(matches []config.IndexedMachine) (config.
 				fmt.Println("没有资产")
 				continue
 			}
+			if len(filtered) == 1 {
+				return filtered[0], nil
+			}
 			current = filtered
 			page = 1
 		case strings.HasPrefix(trimmed, "/"):
@@ -284,6 +293,9 @@ func (a *App) selectMachineFromMatches(matches []config.IndexedMachine) (config.
 				fmt.Println("没有资产")
 				continue
 			}
+			if len(filtered) == 1 {
+				return filtered[0], nil
+			}
 			current = filtered
 			page = 1
 		default:
@@ -291,6 +303,9 @@ func (a *App) selectMachineFromMatches(matches []config.IndexedMachine) (config.
 			if len(filtered) == 0 {
 				fmt.Println("没有资产")
 				continue
+			}
+			if len(filtered) == 1 {
+				return filtered[0], nil
 			}
 			current = filtered
 			page = 1
@@ -377,7 +392,7 @@ func (a *App) browseMachineList(title string, items []config.IndexedMachine) {
 			a.renderMachineList(title, current, page, lastQuery)
 		}
 
-		input, err := a.readLine("[Host]> ")
+		input, err := a.readCommandLine("[Host]> ", &a.hostHistory)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				fmt.Println()
@@ -389,6 +404,7 @@ func (a *App) browseMachineList(title string, items []config.IndexedMachine) {
 
 		trimmed := strings.TrimSpace(input)
 		lastQuery = trimmed
+		appendHistory(&a.hostHistory, trimmed)
 		needsRedraw = false
 		switch strings.ToLower(trimmed) {
 		case "":
@@ -620,6 +636,148 @@ func (a *App) readLine(prompt string) (string, error) {
 	}
 
 	return strings.TrimSpace(input), err
+}
+
+func (a *App) readCommandLine(prompt string, history *[]string) (string, error) {
+	if runtime.GOOS == "windows" || !term.IsTerminal(int(os.Stdin.Fd())) {
+		return a.readLine(prompt)
+	}
+
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		return a.readLine(prompt)
+	}
+	defer func() {
+		_ = term.Restore(fd, oldState)
+	}()
+	defer a.resetInputReader()
+
+	reader := bufio.NewReader(os.Stdin)
+	current := []rune{}
+	draft := ""
+	historyPos := historyLength(history)
+
+	redrawCommandLine(prompt, current)
+
+	for {
+		r, _, err := reader.ReadRune()
+		if err != nil {
+			return "", err
+		}
+
+		switch r {
+		case '\r', '\n':
+			fmt.Fprint(os.Stdout, "\r\n")
+			return string(current), nil
+		case 3:
+			fmt.Fprint(os.Stdout, "^C\r\n")
+			return "", nil
+		case 4:
+			if len(current) == 0 {
+				return "", io.EOF
+			}
+		case 8, 127:
+			if len(current) > 0 {
+				current = current[:len(current)-1]
+				redrawCommandLine(prompt, current)
+			}
+		case 27:
+			next, err := reader.ReadByte()
+			if err != nil {
+				return "", err
+			}
+			if next != '[' {
+				continue
+			}
+
+			action, err := reader.ReadByte()
+			if err != nil {
+				return "", err
+			}
+
+			switch action {
+			case 'A':
+				current, historyPos, draft = previousHistory(history, current, historyPos, draft)
+				redrawCommandLine(prompt, current)
+			case 'B':
+				current, historyPos, draft = nextHistory(history, current, historyPos, draft)
+				redrawCommandLine(prompt, current)
+			}
+		default:
+			if r < 32 {
+				continue
+			}
+			current = append(current, r)
+			redrawCommandLine(prompt, current)
+		}
+	}
+}
+
+func historyLength(history *[]string) int {
+	if history == nil {
+		return 0
+	}
+	return len(*history)
+}
+
+func appendHistory(history *[]string, command string) {
+	if history == nil {
+		return
+	}
+
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return
+	}
+
+	if len(*history) > 0 && (*history)[len(*history)-1] == command {
+		return
+	}
+
+	*history = append(*history, command)
+	if len(*history) > commandHistoryLimit {
+		*history = append([]string(nil), (*history)[len(*history)-commandHistoryLimit:]...)
+	}
+}
+
+func previousHistory(history *[]string, current []rune, historyPos int, draft string) ([]rune, int, string) {
+	if history == nil || len(*history) == 0 {
+		return current, historyPos, draft
+	}
+
+	items := *history
+	if historyPos == len(items) {
+		draft = string(current)
+	}
+	if historyPos <= 0 {
+		return current, historyPos, draft
+	}
+
+	historyPos--
+	return []rune(items[historyPos]), historyPos, draft
+}
+
+func nextHistory(history *[]string, current []rune, historyPos int, draft string) ([]rune, int, string) {
+	if history == nil || len(*history) == 0 {
+		return current, historyPos, draft
+	}
+
+	items := *history
+	lastIndex := len(items) - 1
+	if historyPos < lastIndex {
+		historyPos++
+		return []rune(items[historyPos]), historyPos, draft
+	}
+	if historyPos == lastIndex {
+		return []rune(draft), len(items), draft
+	}
+
+	return current, historyPos, draft
+}
+
+func redrawCommandLine(prompt string, content []rune) {
+	fmt.Fprintf(os.Stdout, "\r\033[K%s%s", prompt, string(content))
 }
 
 func emptyFallback(value string) string {
