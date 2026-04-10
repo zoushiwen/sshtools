@@ -54,6 +54,13 @@ cp config.example.yaml config.yaml
 ./sshtools --config /path/to/config.yaml
 ```
 
+查看版本：
+
+```bash
+./sshtools -v
+./sshtools --version
+```
+
 ## 配置文件查找顺序
 
 程序按以下优先级加载配置：
@@ -109,6 +116,7 @@ machines:
 | `u` | 上传文件 |
 | `d` | 下载文件 |
 | `r` | 重新加载配置 |
+| `-v` / `--version` | 显示版本信息 |
 | `?` | 查看帮助 |
 | `q` | 退出 |
 
