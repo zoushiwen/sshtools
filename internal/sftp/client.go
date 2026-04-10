@@ -7,6 +7,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/pkg/sftp"
 	"github.com/schollz/progressbar/v3"
@@ -39,7 +40,13 @@ type DownloadPlan struct {
 }
 
 type progressWriter struct {
-	bar *progressbar.ProgressBar
+	file *os.File
+	bar  *progressbar.ProgressBar
+}
+
+type progressReader struct {
+	file *os.File
+	bar  *progressbar.ProgressBar
 }
 
 func New(connector *sshconn.Connector) *Client {
@@ -52,7 +59,10 @@ func (c *Client) Connect(machine config.Machine, host string) (*Connection, erro
 		return nil, err
 	}
 
-	sftpClient, err := sftp.NewClient(sshClient)
+	sftpClient, err := sftp.NewClient(
+		sshClient,
+		sftp.UseConcurrentReads(true),
+	)
 	if err != nil {
 		_ = sshClient.Close()
 		return nil, fmt.Errorf("创建 SFTP 客户端失败: %w", err)
@@ -167,11 +177,20 @@ func (c *Connection) UploadFile(localPath, remotePath string, bar *progressbar.P
 
 	reader := io.Reader(localFile)
 	if bar != nil {
-		reader = io.TeeReader(localFile, &progressWriter{bar: bar})
+		reader = &progressReader{file: localFile, bar: bar}
 	}
 
-	if _, err := io.Copy(remoteFile, reader); err != nil {
+	// SFTP sequential writes are significantly slower than scp on higher-latency links.
+	// Use the library's concurrent writer path explicitly to keep throughput competitive.
+	written, err := remoteFile.ReadFromWithConcurrency(reader, 64)
+	if err != nil {
+		if truncateErr := remoteFile.Truncate(written); truncateErr != nil {
+			return fmt.Errorf("上传文件失败: %w，截断远程文件失败: %v", err, truncateErr)
+		}
 		return fmt.Errorf("上传文件失败: %w", err)
+	}
+	if bar != nil {
+		_ = bar.Finish()
 	}
 
 	return nil
@@ -211,11 +230,14 @@ func (c *Connection) DownloadFile(remotePath, localPath string, bar *progressbar
 
 	writer := io.Writer(localFile)
 	if bar != nil {
-		writer = io.MultiWriter(localFile, &progressWriter{bar: bar})
+		writer = &progressWriter{file: localFile, bar: bar}
 	}
 
-	if _, err := io.Copy(writer, remoteFile); err != nil {
+	if _, err := remoteFile.WriteTo(writer); err != nil {
 		return fmt.Errorf("下载文件失败: %w", err)
+	}
+	if bar != nil {
+		_ = bar.Finish()
 	}
 
 	return nil
@@ -226,6 +248,11 @@ func NewProgressBar(description string, total int64) *progressbar.ProgressBar {
 		total,
 		progressbar.OptionSetDescription(description),
 		progressbar.OptionSetWidth(20),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(os.Stderr, "\n")
+		}),
 		progressbar.OptionShowBytes(true),
 		progressbar.OptionSetPredictTime(false),
 		progressbar.OptionSetTheme(progressbar.Theme{
@@ -243,8 +270,21 @@ func isNotExist(err error) bool {
 }
 
 func (w *progressWriter) Write(p []byte) (int, error) {
-	if w.bar != nil {
-		_ = w.bar.Add(len(p))
+	n, err := w.file.Write(p)
+	if n > 0 && w.bar != nil {
+		_ = w.bar.Add64(int64(n))
 	}
-	return len(p), nil
+	return n, err
+}
+
+func (r *progressReader) Read(p []byte) (int, error) {
+	n, err := r.file.Read(p)
+	if n > 0 && r.bar != nil {
+		_ = r.bar.Add64(int64(n))
+	}
+	return n, err
+}
+
+func (r *progressReader) Stat() (os.FileInfo, error) {
+	return r.file.Stat()
 }
