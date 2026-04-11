@@ -6,6 +6,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"sshtools/config"
@@ -13,57 +14,42 @@ import (
 	sftpclient "sshtools/internal/sftp"
 )
 
-var errRetryLocalPath = errors.New("retry local path")
+var (
+	errRetryLocalPath    = errors.New("retry local path")
+	errTransferCancelled = errors.New("transfer cancelled")
+)
 
 func (a *App) handleUpload() {
-	machine, host, conn, err := a.openSFTPConnection("上传")
+	machine, host, conn, err := a.openSFTPConnection()
 	if err != nil {
+		if errors.Is(err, errTransferCancelled) {
+			return
+		}
 		fmt.Printf("上传准备失败: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
-	localPath, err := a.readLine("请输入本地文件路径: ")
+	localPath, info, recursive, err := a.promptUploadLocalSource()
 	if err != nil {
+		if errors.Is(err, errTransferCancelled) {
+			return
+		}
 		fmt.Printf("读取本地路径失败: %v\n", err)
 		return
 	}
-	if strings.TrimSpace(localPath) == "" {
-		fmt.Println("本地路径不能为空")
-		return
-	}
 
-	info, err := os.Stat(localPath)
+	remoteTarget, err := a.promptUploadRemoteTarget()
 	if err != nil {
-		fmt.Printf("本地路径无效: %v\n", err)
-		return
-	}
-
-	recursive := false
-	if info.IsDir() {
-		recursive, err = a.confirmYesNo("检测到本地路径是目录，是否递归上传？[y/N]: ", false)
-		if err != nil {
-			fmt.Printf("读取用户输入失败: %v\n", err)
+		if errors.Is(err, errTransferCancelled) {
 			return
 		}
-		if !recursive {
-			fmt.Println("已取消上传目录")
-			return
-		}
-	}
-
-	remoteTarget, err := a.readLine("请输入远程目标路径: ")
-	if err != nil {
 		fmt.Printf("读取远程路径失败: %v\n", err)
-		return
-	}
-	if strings.TrimSpace(remoteTarget) == "" {
-		fmt.Println("远程目标路径不能为空")
 		return
 	}
 
 	fmt.Printf("开始上传到 %s (%s)\n", machine.Machine.Name, host)
-	if info.IsDir() {
+	if recursive {
 		files, total, err := fsutil.CollectLocalFiles(localPath)
 		if err != nil {
 			fmt.Printf("扫描本地目录失败: %v\n", err)
@@ -81,7 +67,7 @@ func (a *App) handleUpload() {
 				fmt.Printf("上传目录失败: %v\n", err)
 				return
 			}
-			fmt.Printf("目录为空，已创建远程目录: %s\n", remoteRoot)
+			fmt.Println("上传完成！共上传 0 个文件，总大小 0B")
 			return
 		}
 
@@ -90,7 +76,7 @@ func (a *App) handleUpload() {
 			fmt.Printf("上传目录失败: %v\n", err)
 			return
 		}
-		fmt.Printf("上传完成: %s\n", remoteRoot)
+		fmt.Printf("上传完成！共上传 %d 个文件，总大小 %s\n", len(files), formatTransferSize(total))
 		return
 	}
 
@@ -106,24 +92,26 @@ func (a *App) handleUpload() {
 		return
 	}
 
-	fmt.Printf("上传完成: %s\n", remotePath)
+	fmt.Printf("上传完成！共上传 1 个文件，总大小 %s\n", formatTransferSize(info.Size()))
 }
 
 func (a *App) handleDownload() {
-	machine, host, conn, err := a.openSFTPConnection("下载")
+	machine, host, conn, err := a.openSFTPConnection()
 	if err != nil {
+		if errors.Is(err, errTransferCancelled) {
+			return
+		}
 		fmt.Printf("下载准备失败: %v\n", err)
 		return
 	}
 	defer conn.Close()
 
-	remoteInput, err := a.readLine("请输入远程文件/目录路径: ")
+	remoteInput, err := a.promptDownloadRemotePath(conn)
 	if err != nil {
+		if errors.Is(err, errTransferCancelled) {
+			return
+		}
 		fmt.Printf("读取远程路径失败: %v\n", err)
-		return
-	}
-	if strings.TrimSpace(remoteInput) == "" {
-		fmt.Println("远程路径不能为空")
 		return
 	}
 
@@ -136,9 +124,13 @@ func (a *App) handleDownload() {
 	var plans []sftpclient.DownloadPlan
 	var savedPaths []string
 	for {
-		localInput, readErr := a.readLine("请输入本地保存路径（直接回车使用当前目录）: ")
+		localInput, readErr := a.readLine("请输入本地保存路径（回车默认当前目录）> ")
 		if readErr != nil {
 			fmt.Printf("读取本地路径失败: %v\n", readErr)
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(localInput), "q") {
+			_ = a.cancelTransfer()
 			return
 		}
 
@@ -147,21 +139,27 @@ func (a *App) handleDownload() {
 			fmt.Println("请重新输入本地保存路径")
 			continue
 		}
+		if errors.Is(err, errTransferCancelled) {
+			return
+		}
 		if err != nil {
 			fmt.Printf("准备下载任务失败: %v\n", err)
 			return
+		}
+		if strings.TrimSpace(localInput) == "" {
+			a.printDownloadTargetPreview(cwd, savedPaths)
 		}
 		break
 	}
 
 	if len(plans) == 0 {
-		fmt.Println("目标目录为空，无需下载文件")
 		for _, savedPath := range savedPaths {
 			if err := os.MkdirAll(savedPath, 0o755); err != nil {
 				fmt.Printf("创建本地目录失败: %v\n", err)
 				return
 			}
 		}
+		fmt.Println(buildDownloadStatus(cwd, savedPaths, 0, 0))
 		return
 	}
 
@@ -179,26 +177,16 @@ func (a *App) handleDownload() {
 		}
 	}
 
-	fmt.Println("下载完成，保存路径:")
-	for _, savedPath := range savedPaths {
-		fmt.Printf("- %s\n", savedPath)
-	}
+	fmt.Println(buildDownloadStatus(cwd, savedPaths, len(plans), total))
 }
 
-func (a *App) openSFTPConnection(action string) (machine config.IndexedMachine, host string, conn *sftpclient.Connection, err error) {
-	hostInput, readErr := a.readLine(fmt.Sprintf("请输入用于%s的主机名或 ID: ", action))
-	if readErr != nil {
-		err = readErr
+func (a *App) openSFTPConnection() (machine config.IndexedMachine, host string, conn *sftpclient.Connection, err error) {
+	machine, err = a.selectTransferMachine()
+	if err != nil {
 		return
 	}
 
-	machine, resolveErr := a.resolveMachineInput(hostInput)
-	if resolveErr != nil {
-		err = resolveErr
-		return
-	}
-
-	host, err = a.selectHost(machine)
+	host, err = a.selectTransferHost(machine)
 	if err != nil {
 		return
 	}
@@ -209,6 +197,292 @@ func (a *App) openSFTPConnection(action string) (machine config.IndexedMachine, 
 	}
 
 	return
+}
+
+func (a *App) selectTransferMachine() (config.IndexedMachine, error) {
+	items := a.cfg.IndexedMachines()
+	if len(items) == 0 {
+		return config.IndexedMachine{}, fmt.Errorf("暂无主机数据")
+	}
+
+	a.renderTransferMachineList()
+	return a.promptTransferMachineInput(items)
+}
+
+func (a *App) promptTransferMachineInput(items []config.IndexedMachine) (config.IndexedMachine, error) {
+	current := items
+
+	for {
+		input, err := a.readCommandLine("请输入主机 ID、主机名或 IP> ", &a.hostHistory)
+		if err != nil {
+			return config.IndexedMachine{}, err
+		}
+
+		trimmed := strings.TrimSpace(input)
+		appendHistory(&a.hostHistory, trimmed)
+
+		switch {
+		case trimmed == "":
+			fmt.Println("输入不能为空，请重新输入")
+			continue
+		case strings.EqualFold(trimmed, "q"):
+			return config.IndexedMachine{}, a.cancelTransfer()
+		}
+
+		if id, convErr := strconv.Atoi(trimmed); convErr == nil {
+			machine, ok := a.cfg.FindByID(id)
+			if !ok {
+				fmt.Println("未找到匹配主机，请重新输入")
+				continue
+			}
+			return machine, nil
+		}
+
+		exact := strings.HasPrefix(trimmed, "/")
+		query := trimmed
+		if exact {
+			query = strings.TrimSpace(strings.TrimPrefix(trimmed, "/"))
+			if query == "" {
+				fmt.Println("输入不能为空，请重新输入")
+				continue
+			}
+		}
+
+		matches := searchTransferMachines(current, query, exact)
+		switch len(matches) {
+		case 0:
+			fmt.Println("未找到匹配主机，请重新输入")
+		case 1:
+			return matches[0], nil
+		default:
+			current = matches
+			a.renderTransferMachineMatches(matches)
+			continue
+		}
+	}
+}
+
+func (a *App) selectTransferHost(machine config.IndexedMachine) (string, error) {
+	publicIP := strings.TrimSpace(machine.Machine.PublicIP)
+	intranetIP := strings.TrimSpace(machine.Machine.IntranetIP)
+
+	switch {
+	case publicIP == "" && intranetIP == "":
+		return "", fmt.Errorf("主机 %s 未配置可用 IP", machine.Machine.Name)
+	case publicIP == "":
+		fmt.Printf("该主机未配置外网 IP，自动使用内网 IP: %s\n", intranetIP)
+		return intranetIP, nil
+	case intranetIP == "":
+		fmt.Printf("该主机未配置内网 IP，自动使用外网 IP: %s\n", publicIP)
+		return publicIP, nil
+	}
+
+	switch a.cfg.DefaultIPType {
+	case config.IPSelectionPublic:
+		fmt.Printf("使用外网 IP: %s\n", publicIP)
+		return publicIP, nil
+	case config.IPSelectionIntranet:
+		fmt.Printf("使用内网 IP: %s\n", intranetIP)
+		return intranetIP, nil
+	}
+
+	for {
+		choice, err := a.readLine(fmt.Sprintf("使用 [1] 外网 IP(%s)  [2] 内网 IP(%s) > ", publicIP, intranetIP))
+		if err != nil {
+			return "", err
+		}
+
+		switch strings.TrimSpace(choice) {
+		case "1":
+			return publicIP, nil
+		case "2":
+			return intranetIP, nil
+		default:
+			fmt.Println("请输入 1 或 2")
+		}
+	}
+}
+
+func (a *App) promptUploadLocalSource() (string, os.FileInfo, bool, error) {
+	for {
+		localPath, err := a.readLine("请输入本地文件路径> ")
+		if err != nil {
+			return "", nil, false, err
+		}
+
+		switch {
+		case strings.EqualFold(localPath, "q"):
+			return "", nil, false, a.cancelTransfer()
+		case strings.TrimSpace(localPath) == "":
+			fmt.Println("路径不能为空，请重新输入")
+			continue
+		}
+
+		info, err := os.Stat(localPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Println("本地路径不存在，请重新输入")
+				continue
+			}
+			return "", nil, false, err
+		}
+
+		if !info.IsDir() {
+			return localPath, info, false, nil
+		}
+
+		recursive, err := a.confirmYesNo("检测到目录，是否递归上传？[y/N] ", false)
+		if err != nil {
+			return "", nil, false, err
+		}
+		if !recursive {
+			fmt.Println("请输入具体文件路径")
+			continue
+		}
+
+		return localPath, info, true, nil
+	}
+}
+
+func (a *App) promptUploadRemoteTarget() (string, error) {
+	for {
+		remoteTarget, err := a.readLine("请输入远程目标路径> ")
+		if err != nil {
+			return "", err
+		}
+
+		switch {
+		case strings.EqualFold(remoteTarget, "q"):
+			return "", a.cancelTransfer()
+		case strings.TrimSpace(remoteTarget) == "":
+			fmt.Println("路径不能为空，请重新输入")
+			continue
+		}
+
+		return normalizeUploadRemoteTarget(remoteTarget), nil
+	}
+}
+
+func (a *App) promptDownloadRemotePath(conn *sftpclient.Connection) (string, error) {
+	for {
+		remoteInput, err := a.readLine("请输入远程文件或目录路径> ")
+		if err != nil {
+			return "", err
+		}
+
+		switch {
+		case strings.EqualFold(remoteInput, "q"):
+			return "", a.cancelTransfer()
+		case strings.TrimSpace(remoteInput) == "":
+			fmt.Println("路径不能为空，请重新输入")
+			continue
+		}
+
+		if fsutil.HasGlob(remoteInput) {
+			matches, err := conn.Glob(remoteInput)
+			if err != nil {
+				fmt.Printf("展开通配符失败: %v\n", err)
+				continue
+			}
+			if len(matches) == 0 {
+				fmt.Println("未匹配到任何远程文件，请重新输入")
+				continue
+			}
+
+			fmt.Println("匹配结果：")
+			for _, match := range matches {
+				fmt.Printf("- %s\n", match)
+			}
+
+			confirmed, err := a.confirmYesNo(fmt.Sprintf("共匹配 %d 个文件，确认下载？[y/N] ", len(matches)), false)
+			if err != nil {
+				return "", err
+			}
+			if !confirmed {
+				return "", a.cancelTransfer()
+			}
+
+			return remoteInput, nil
+		}
+
+		info, err := conn.Stat(remoteInput)
+		if err != nil {
+			fmt.Println("远程路径不存在或不可访问，请重新输入")
+			continue
+		}
+		if info.IsDir() {
+			confirmed, err := a.confirmYesNo("检测到远程目录，是否递归下载？[y/N] ", false)
+			if err != nil {
+				return "", err
+			}
+			if !confirmed {
+				return "", a.cancelTransfer()
+			}
+		}
+
+		return remoteInput, nil
+	}
+}
+
+func (a *App) renderTransferMachineList() {
+	clearScreen()
+
+	headers := []string{
+		colorizeGreen("ID"),
+		colorizeGreen("名称"),
+		colorizeGreen("内网 IP"),
+		colorizeGreen("外网 IP"),
+		colorizeGreen("端口"),
+		colorizeGreen("用户"),
+	}
+
+	nextID := 1
+	for _, group := range a.cfg.Groups {
+		if len(group.Machines) == 0 {
+			continue
+		}
+
+		fmt.Printf("[%s / %s]\n", group.Name, group.Tag)
+		rows := make([][]string, 0, len(group.Machines))
+		for _, machine := range group.Machines {
+			rows = append(rows, []string{
+				strconv.Itoa(nextID),
+				machine.Name,
+				emptyFallback(machine.IntranetIP),
+				emptyFallback(machine.PublicIP),
+				strconv.Itoa(machine.Port),
+				machine.User,
+			})
+			nextID++
+		}
+		renderMachineTable(headers, rows)
+		fmt.Println()
+	}
+}
+
+func (a *App) renderTransferMachineMatches(items []config.IndexedMachine) {
+	clearScreen()
+	fmt.Println("匹配结果：")
+
+	headers := []string{
+		colorizeGreen("ID"),
+		colorizeGreen("名称"),
+		colorizeGreen("分组"),
+		colorizeGreen("内网 IP"),
+		colorizeGreen("外网 IP"),
+	}
+	rows := make([][]string, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, []string{
+			strconv.Itoa(item.ID),
+			item.Machine.Name,
+			item.GroupTag,
+			emptyFallback(item.Machine.IntranetIP),
+			emptyFallback(item.Machine.PublicIP),
+		})
+	}
+
+	renderMachineTable(headers, rows)
 }
 
 func (a *App) buildDownloadPlans(conn *sftpclient.Connection, cwd, remoteInput, localInput string) ([]sftpclient.DownloadPlan, []string, error) {
@@ -231,19 +505,16 @@ func (a *App) buildDownloadPlans(conn *sftpclient.Connection, cwd, remoteInput, 
 func (a *App) buildSingleFileDownloadPlan(cwd, remotePath, localInput string, size int64) ([]sftpclient.DownloadPlan, []string, error) {
 	decision, err := fsutil.ResolveDownloadTarget(localInput, cwd, path.Base(remotePath), false)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("%w: %v", errRetryLocalPath, err)
 	}
 
 	if err := a.ensureLocalDirectory(decision.DirToEnsure); err != nil {
 		return nil, nil, err
 	}
 
-	finalPath, cancelled, err := a.resolveExistingLocalFile(decision.FinalPath)
+	finalPath, err := a.resolveExistingLocalFile(decision.FinalPath)
 	if err != nil {
 		return nil, nil, err
-	}
-	if cancelled {
-		return nil, nil, errors.New("下载已取消")
 	}
 
 	return []sftpclient.DownloadPlan{{
@@ -275,12 +546,9 @@ func (a *App) buildDirectoryDownloadPlans(conn *sftpclient.Connection, cwd, remo
 	plans := make([]sftpclient.DownloadPlan, 0, len(files))
 	for _, file := range files {
 		targetPath := filepath.Join(decision.FinalPath, filepath.FromSlash(file.Rel))
-		finalPath, cancelled, err := a.resolveExistingLocalFile(targetPath)
+		finalPath, err := a.resolveExistingLocalFile(targetPath)
 		if err != nil {
 			return nil, nil, err
-		}
-		if cancelled {
-			return nil, nil, errors.New("下载已取消")
 		}
 
 		plans = append(plans, sftpclient.DownloadPlan{
@@ -334,12 +602,9 @@ func (a *App) buildGlobDownloadPlans(conn *sftpclient.Connection, cwd, remoteInp
 
 			for _, file := range files {
 				targetPath := filepath.Join(rootDir, filepath.FromSlash(file.Rel))
-				finalPath, cancelled, err := a.resolveExistingLocalFile(targetPath)
+				finalPath, err := a.resolveExistingLocalFile(targetPath)
 				if err != nil {
 					return nil, nil, err
-				}
-				if cancelled {
-					return nil, nil, errors.New("下载已取消")
 				}
 
 				plans = append(plans, sftpclient.DownloadPlan{
@@ -353,12 +618,9 @@ func (a *App) buildGlobDownloadPlans(conn *sftpclient.Connection, cwd, remoteInp
 		}
 
 		targetPath := filepath.Join(baseDecision.FinalPath, path.Base(match))
-		finalPath, cancelled, err := a.resolveExistingLocalFile(targetPath)
+		finalPath, err := a.resolveExistingLocalFile(targetPath)
 		if err != nil {
 			return nil, nil, err
-		}
-		if cancelled {
-			return nil, nil, errors.New("下载已取消")
 		}
 
 		plans = append(plans, sftpclient.DownloadPlan{
@@ -400,29 +662,29 @@ func (a *App) ensureLocalDirectory(dir string) error {
 	return nil
 }
 
-func (a *App) resolveExistingLocalFile(targetPath string) (string, bool, error) {
+func (a *App) resolveExistingLocalFile(targetPath string) (string, error) {
 	if _, err := os.Stat(targetPath); err != nil {
 		if os.IsNotExist(err) {
-			return targetPath, false, nil
+			return targetPath, nil
 		}
-		return "", false, err
+		return "", err
 	}
 
 	for {
-		choice, err := a.readLine(fmt.Sprintf("文件 %s 已存在，选择 [o]覆盖 [r]重命名 [c]取消: ", targetPath))
+		choice, err := a.readLine("文件已存在，是否覆盖？[y/N/r] ")
 		if err != nil {
-			return "", false, err
+			return "", err
 		}
 
 		switch strings.ToLower(strings.TrimSpace(choice)) {
-		case "o":
-			return targetPath, false, nil
+		case "y", "yes":
+			return targetPath, nil
 		case "r":
-			return fsutil.AutoRename(targetPath), false, nil
-		case "c", "":
-			return "", true, nil
+			return fsutil.AutoRename(targetPath), nil
+		case "", "n", "no":
+			return "", a.cancelTransfer()
 		default:
-			fmt.Println("请输入 o、r 或 c")
+			fmt.Println("请输入 y、n 或 r")
 		}
 	}
 }
@@ -444,4 +706,107 @@ func (a *App) confirmYesNo(prompt string, defaultValue bool) (bool, error) {
 		fmt.Println("请输入 y 或 n")
 		return a.confirmYesNo(prompt, defaultValue)
 	}
+}
+
+func (a *App) cancelTransfer() error {
+	a.renderMainMenu("")
+	return errTransferCancelled
+}
+
+func (a *App) printDownloadTargetPreview(cwd string, savedPaths []string) {
+	if len(savedPaths) == 0 {
+		return
+	}
+
+	location := "./"
+	if len(savedPaths) == 1 {
+		location = displayLocalPath(cwd, savedPaths[0])
+	}
+	fmt.Printf("将保存至：%s\n", location)
+}
+
+func buildDownloadStatus(cwd string, savedPaths []string, fileCount int, total int64) string {
+	location := "./"
+	if len(savedPaths) == 1 {
+		location = displayLocalPath(cwd, savedPaths[0])
+	}
+	return fmt.Sprintf("下载完成！保存至：%s  共下载 %d 个文件，总大小 %s", location, fileCount, formatTransferSize(total))
+}
+
+func searchTransferMachines(items []config.IndexedMachine, query string, exact bool) []config.IndexedMachine {
+	normalized := strings.ToLower(strings.TrimSpace(query))
+	if normalized == "" {
+		return nil
+	}
+
+	matches := make([]config.IndexedMachine, 0)
+	for _, item := range items {
+		values := []string{
+			strings.ToLower(item.Machine.Name),
+			strings.ToLower(item.Machine.IntranetIP),
+			strings.ToLower(item.Machine.PublicIP),
+		}
+
+		for _, value := range values {
+			if value == "" {
+				continue
+			}
+
+			if exact && value == normalized {
+				matches = append(matches, item)
+				break
+			}
+			if !exact && strings.Contains(value, normalized) {
+				matches = append(matches, item)
+				break
+			}
+		}
+	}
+
+	return matches
+}
+
+func normalizeUploadRemoteTarget(target string) string {
+	trimmed := strings.TrimSpace(target)
+	if trimmed == "" || trimmed == "/" || strings.HasSuffix(trimmed, "/") {
+		return trimmed
+	}
+	return trimmed + "/"
+}
+
+func displayLocalPath(cwd, target string) string {
+	if strings.TrimSpace(target) == "" {
+		return "./"
+	}
+
+	if rel, err := filepath.Rel(cwd, target); err == nil && rel != "" && rel != "." && !strings.HasPrefix(rel, "..") {
+		return "." + string(os.PathSeparator) + rel
+	}
+	if target == cwd {
+		return "./"
+	}
+	if filepath.IsAbs(target) {
+		return target
+	}
+	if strings.HasPrefix(target, "."+string(os.PathSeparator)) || target == "." {
+		return target
+	}
+	return "." + string(os.PathSeparator) + target
+}
+
+func formatTransferSize(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%dB", size)
+	}
+
+	div := int64(unit)
+	exp := 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+
+	suffixes := []string{"KB", "MB", "GB", "TB", "PB"}
+	return fmt.Sprintf("%.1f%s", float64(size)/float64(div), suffixes[exp])
 }
