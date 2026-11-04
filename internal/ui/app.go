@@ -844,6 +844,7 @@ func (a *App) printConfigStatus(prefix string) {
 	if a.cfg.UsingEmbeddedDefault {
 		if prefix == "" {
 			fmt.Println("当前使用默认配置")
+			fmt.Println("请添加自定义配置文件到 ～/.ssh-tools/config.yaml ")
 			return
 		}
 		fmt.Printf("%s: 当前使用默认配置\n", prefix)

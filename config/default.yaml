@@ -11,7 +11,7 @@ groups:
         port: 22
         user: root
         password: "xxx"                    # 登录密码，与 private_key_path 至少配置一项
-        private_key_path: ~/.ssh/id_rsa    # SSH 私钥路径，支持 ~ 展开和相对配置文件的路径
+        private_key_path: ""   # SSH 私钥路径，支持 ~ 展开和相对配置文件的路径
         private_key_passphrase: ""         # 私钥口令，无口令时留空
 
   - name: 测试环境
@@ -22,4 +22,5 @@ groups:
         public_ip: 5.6.7.8
         port: 22
         user: ubuntu
-        private_key_path: ~/.ssh/id_rsa
+        password: "xxx"
+        private_key_path: ""
